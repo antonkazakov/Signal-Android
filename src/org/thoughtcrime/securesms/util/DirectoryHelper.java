@@ -18,9 +18,9 @@ import com.annimon.stream.Collectors;
 import com.annimon.stream.Stream;
 
 import org.thoughtcrime.securesms.ApplicationContext;
+import org.thoughtcrime.securesms.BuildConfig;
 import org.thoughtcrime.securesms.R;
 import org.thoughtcrime.securesms.contacts.ContactAccessor;
-import org.thoughtcrime.securesms.contacts.ContactsDatabase;
 import org.thoughtcrime.securesms.crypto.SessionUtil;
 import org.thoughtcrime.securesms.database.Address;
 import org.thoughtcrime.securesms.database.DatabaseFactory;
@@ -31,13 +31,25 @@ import org.thoughtcrime.securesms.jobs.MultiDeviceContactUpdateJob;
 import org.thoughtcrime.securesms.notifications.MessageNotifier;
 import org.thoughtcrime.securesms.permissions.Permissions;
 import org.thoughtcrime.securesms.push.AccountManagerFactory;
+import org.thoughtcrime.securesms.push.ContactDiscoveryServiceTrustStore;
 import org.thoughtcrime.securesms.recipients.Recipient;
 import org.thoughtcrime.securesms.sms.IncomingJoinedMessage;
 import org.whispersystems.libsignal.util.guava.Optional;
 import org.whispersystems.signalservice.api.SignalServiceAccountManager;
 import org.whispersystems.signalservice.api.push.ContactTokenDetails;
+import org.whispersystems.signalservice.api.push.TrustStore;
+import org.whispersystems.signalservice.api.push.exceptions.NonSuccessfulResponseCodeException;
+import org.whispersystems.signalservice.api.push.exceptions.PushNetworkException;
+import org.whispersystems.signalservice.internal.contacts.crypto.Quote;
+import org.whispersystems.signalservice.internal.contacts.crypto.UnauthenticatedQuoteException;
+import org.whispersystems.signalservice.internal.contacts.crypto.UnauthenticatedResponseException;
 
 import java.io.IOException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SignatureException;
+import java.security.cert.CertificateException;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.HashSet;
@@ -108,6 +120,8 @@ public class DirectoryHelper {
 
       recipientDatabase.setRegistered(activeAddresses, inactiveAddresses);
       updateContactsDatabase(context, activeAddresses, true);
+
+      crossCheckWithNewContactDiscoveryService(context, accountManager, eligibleContactNumbers, activeAddresses);
 
       if (TextSecurePreferences.hasSuccessfullyRetrievedDirectory(context)) {
         return newlyActiveAddresses;
@@ -240,6 +254,58 @@ public class DirectoryHelper {
       return Optional.absent();
     }
   }
+
+  private static void crossCheckWithNewContactDiscoveryService(@NonNull Context                     context,
+                                                               @NonNull SignalServiceAccountManager accountManager,
+                                                               @NonNull Set<String>                 requestedNumbers,
+                                                               @NonNull List<Address>               registeredAddressesLegacy)
+  {
+    try {
+      KeyStore     iasKeyStore      = getIasKeyStore(context);
+      List<String> registered       = accountManager.getRegisteredUsers(iasKeyStore, requestedNumbers, BuildConfig.MRENCLAVE);
+      Set<String>  registeredLegacy = Stream.of(registeredAddressesLegacy).map(Address::serialize).collect(Collectors.toSet());
+
+      if (registered.size() == registeredLegacy.size() && registeredLegacy.containsAll(registered)) {
+        accountManager.reportContactDiscoveryServiceMatch();
+        Log.i(TAG, "New contact discovery service request matched existing results.");
+      } else {
+        accountManager.reportContactDiscoveryServiceMismatch();
+        Log.w(TAG, "New contact discovery service request did NOT match existing results.");
+      }
+
+    } catch(NonSuccessfulResponseCodeException e) {
+      if (e.getResponseCode() >= 400 && e.getResponseCode() < 500) {
+        accountManager.reportContactDiscoveryServiceClientError();
+        Log.w(TAG, "Failed due to a client error.", e);
+      } else if (e.getResponseCode() >= 500 && e.getResponseCode() < 600) {
+        accountManager.reportContactDiscoveryServiceServerError();
+        Log.w(TAG, "Failed due to a server error.", e);
+      } else {
+        accountManager.reportContactDiscoveryServiceUnexpectedError();
+        Log.w(TAG, "Failed with an unexpected response code.", e);
+      }
+    } catch (CertificateException | SignatureException | UnauthenticatedQuoteException | Quote.InvalidQuoteFormatException e) {
+      accountManager.reportContactDiscoveryServiceAttestationError();
+      Log.w(TAG, "Failed during attestation.", e);
+    } catch (PushNetworkException e) {
+      Log.w(TAG, "Failed due to poor network.", e);
+    } catch (IOException | NoSuchAlgorithmException | KeyStoreException | UnauthenticatedResponseException e) {
+      accountManager.reportContactDiscoveryServiceUnexpectedError();
+      Log.w(TAG, "Failed for an unknown reason.", e);
+    }
+  }
+
+  private static KeyStore getIasKeyStore(@NonNull Context context)
+      throws CertificateException, NoSuchAlgorithmException, IOException, KeyStoreException
+  {
+    TrustStore contactTrustStore = new ContactDiscoveryServiceTrustStore(context);
+
+    KeyStore keyStore = KeyStore.getInstance("BKS");
+    keyStore.load(contactTrustStore.getKeyStoreInputStream(), contactTrustStore.getKeyStorePassword().toCharArray());
+
+    return keyStore;
+  }
+
 
   private static class AccountHolder {
 
