@@ -50,6 +50,7 @@ import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SignatureException;
 import java.security.cert.CertificateException;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.HashSet;
@@ -60,6 +61,8 @@ import java.util.Set;
 public class DirectoryHelper {
 
   private static final String TAG = DirectoryHelper.class.getSimpleName();
+
+  private static final int CONTACT_BATCH_SIZE = 2048;
 
   public static void refreshDirectory(@NonNull Context context, boolean notifyOfNewUsers)
       throws IOException
@@ -92,15 +95,43 @@ public class DirectoryHelper {
     RecipientDatabase recipientDatabase                       = DatabaseFactory.getRecipientDatabase(context);
     Stream<String>    eligibleRecipientDatabaseContactNumbers = Stream.of(recipientDatabase.getAllAddresses()).filter(Address::isPhone).map(Address::toPhoneString);
     Stream<String>    eligibleSystemDatabaseContactNumbers    = Stream.of(ContactAccessor.getInstance().getAllContactsWithNumbers(context)).map(Address::serialize);
-    Set<String>       eligibleContactNumbers                  = Stream.concat(eligibleRecipientDatabaseContactNumbers, eligibleSystemDatabaseContactNumbers).collect(Collectors.toSet());
+    Set<String>       dedupedEligibleContactNumbers           = Stream.concat(eligibleRecipientDatabaseContactNumbers, eligibleSystemDatabaseContactNumbers).collect(Collectors.toSet());
+    List<String>      eligibleContactNumbers                  = new ArrayList<>(dedupedEligibleContactNumbers);
 
-    List<ContactTokenDetails> activeTokens = accountManager.getContacts(eligibleContactNumbers);
+    List<Address> allActiveAddresses   = new LinkedList<>();
+    List<Address> newlyActiveAddresses = new LinkedList<>();
+
+    for (int i = 0; i < eligibleContactNumbers.size(); i += CONTACT_BATCH_SIZE) {
+      List<String>  numbers      = eligibleContactNumbers.subList(i, Math.min(eligibleContactNumbers.size(), i + CONTACT_BATCH_SIZE));
+      RefreshResult result       = refreshDirectory(context, accountManager, recipientDatabase, new HashSet<>(numbers));
+
+      allActiveAddresses.addAll(result.getAllActiveAddresses());
+      newlyActiveAddresses.addAll(result.getNewlyActiveAddresses());
+    }
+
+    updateContactsDatabase(context, allActiveAddresses, true);
+
+    if (TextSecurePreferences.hasSuccessfullyRetrievedDirectory(context)) {
+      return newlyActiveAddresses;
+    } else {
+      TextSecurePreferences.setHasSuccessfullyRetrievedDirectory(context, true);
+      return new LinkedList<>();
+    }
+  }
+
+  private static RefreshResult refreshDirectory(@NonNull Context                     context,
+                                                @NonNull SignalServiceAccountManager accountManager,
+                                                @NonNull RecipientDatabase           recipientDatabase,
+                                                @NonNull Set<String>                 numbers)
+      throws IOException
+  {
+    List<ContactTokenDetails> activeTokens = accountManager.getContacts(numbers);
 
     if (activeTokens != null) {
       List<Address> activeAddresses   = new LinkedList<>();
       List<Address> inactiveAddresses = new LinkedList<>();
 
-      Set<String>  inactiveContactNumbers = new HashSet<>(eligibleContactNumbers);
+      Set<String>  inactiveContactNumbers = new HashSet<>(numbers);
 
       for (ContactTokenDetails activeToken : activeTokens) {
         activeAddresses.add(Address.fromSerialized(activeToken.getNumber()));
@@ -119,19 +150,13 @@ public class DirectoryHelper {
                                                    .toList();
 
       recipientDatabase.setRegistered(activeAddresses, inactiveAddresses);
-      updateContactsDatabase(context, activeAddresses, true);
 
-      crossCheckWithNewContactDiscoveryService(context, accountManager, eligibleContactNumbers, activeAddresses);
+      crossCheckWithNewContactDiscoveryService(context, accountManager, numbers, activeAddresses);
 
-      if (TextSecurePreferences.hasSuccessfullyRetrievedDirectory(context)) {
-        return newlyActiveAddresses;
-      } else {
-        TextSecurePreferences.setHasSuccessfullyRetrievedDirectory(context, true);
-        return new LinkedList<>();
-      }
+      return new RefreshResult(activeAddresses, newlyActiveAddresses);
     }
 
-    return new LinkedList<>();
+    return new RefreshResult(Collections.emptyList(), Collections.emptyList());
   }
 
   public static RegisteredState refreshDirectoryFor(@NonNull  Context context,
@@ -328,4 +353,22 @@ public class DirectoryHelper {
 
   }
 
+  private static class RefreshResult {
+
+    private final List<Address> allActiveAddresses;
+    private final List<Address> newlyActiveAddresses;
+
+    private RefreshResult(List<Address> allActiveAddresses, List<Address> newlyActiveAddresses) {
+      this.allActiveAddresses = allActiveAddresses;
+      this.newlyActiveAddresses = newlyActiveAddresses;
+    }
+
+    public List<Address> getAllActiveAddresses() {
+      return allActiveAddresses;
+    }
+
+    public List<Address> getNewlyActiveAddresses() {
+      return newlyActiveAddresses;
+    }
+  }
 }
