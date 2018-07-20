@@ -312,12 +312,12 @@ public class DirectoryHelper {
         accountManager.reportContactDiscoveryServiceUnexpectedError();
         Log.w(TAG, "Failed with an unexpected response code.", e);
       }
-    } catch (CertificateException | SignatureException | UnauthenticatedQuoteException | Quote.InvalidQuoteFormatException e) {
+    } catch (CertificateException | SignatureException | UnauthenticatedQuoteException | UnauthenticatedResponseException | Quote.InvalidQuoteFormatException e) {
       accountManager.reportContactDiscoveryServiceAttestationError();
       Log.w(TAG, "Failed during attestation.", e);
     } catch (PushNetworkException e) {
       Log.w(TAG, "Failed due to poor network.", e);
-    } catch (IOException | NoSuchAlgorithmException | KeyStoreException | UnauthenticatedResponseException e) {
+    } catch (IOException | NoSuchAlgorithmException | KeyStoreException e) {
       accountManager.reportContactDiscoveryServiceUnexpectedError();
       Log.w(TAG, "Failed for an unknown reason.", e);
     }
