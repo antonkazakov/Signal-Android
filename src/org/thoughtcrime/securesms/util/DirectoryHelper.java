@@ -185,9 +185,12 @@ public class DirectoryHelper {
         notifyNewUsers(context, Collections.singletonList(recipient.getAddress()));
       }
 
+      crossCheckWithNewContactDiscoveryService(context, accountManager, Collections.singleton(number), Collections.singletonList(recipient.getAddress()));
+
       return RegisteredState.REGISTERED;
     } else {
       recipientDatabase.setRegistered(recipient, RegisteredState.NOT_REGISTERED);
+      crossCheckWithNewContactDiscoveryService(context, accountManager, Collections.singleton(number), Collections.emptyList());
       return RegisteredState.NOT_REGISTERED;
     }
   }
