@@ -7,11 +7,11 @@ import org.whispersystems.signalservice.api.push.TrustStore;
 
 import java.io.InputStream;
 
-public class ContactDiscoveryServiceTrustStore implements TrustStore {
+public class IasTrustStore implements TrustStore {
 
   private final Context context;
 
-  public ContactDiscoveryServiceTrustStore(Context context) {
+  public IasTrustStore(Context context) {
     this.context = context.getApplicationContext();
   }
 

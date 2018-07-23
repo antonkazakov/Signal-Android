@@ -31,7 +31,7 @@ import org.thoughtcrime.securesms.jobs.MultiDeviceContactUpdateJob;
 import org.thoughtcrime.securesms.notifications.MessageNotifier;
 import org.thoughtcrime.securesms.permissions.Permissions;
 import org.thoughtcrime.securesms.push.AccountManagerFactory;
-import org.thoughtcrime.securesms.push.ContactDiscoveryServiceTrustStore;
+import org.thoughtcrime.securesms.push.IasTrustStore;
 import org.thoughtcrime.securesms.recipients.Recipient;
 import org.thoughtcrime.securesms.sms.IncomingJoinedMessage;
 import org.whispersystems.libsignal.util.guava.Optional;
@@ -300,18 +300,6 @@ public class DirectoryHelper {
         accountManager.reportContactDiscoveryServiceMismatch();
         Log.w(TAG, "New contact discovery service request did NOT match existing results.");
       }
-
-    } catch(NonSuccessfulResponseCodeException e) {
-      if (e.getResponseCode() >= 400 && e.getResponseCode() < 500) {
-        accountManager.reportContactDiscoveryServiceClientError();
-        Log.w(TAG, "Failed due to a client error.", e);
-      } else if (e.getResponseCode() >= 500 && e.getResponseCode() < 600) {
-        accountManager.reportContactDiscoveryServiceServerError();
-        Log.w(TAG, "Failed due to a server error.", e);
-      } else {
-        accountManager.reportContactDiscoveryServiceUnexpectedError();
-        Log.w(TAG, "Failed with an unexpected response code.", e);
-      }
     } catch (CertificateException | SignatureException | UnauthenticatedQuoteException | UnauthenticatedResponseException | Quote.InvalidQuoteFormatException e) {
       accountManager.reportContactDiscoveryServiceAttestationError();
       Log.w(TAG, "Failed during attestation.", e);
@@ -326,7 +314,7 @@ public class DirectoryHelper {
   private static KeyStore getIasKeyStore(@NonNull Context context)
       throws CertificateException, NoSuchAlgorithmException, IOException, KeyStoreException
   {
-    TrustStore contactTrustStore = new ContactDiscoveryServiceTrustStore(context);
+    TrustStore contactTrustStore = new IasTrustStore(context);
 
     KeyStore keyStore = KeyStore.getInstance("BKS");
     keyStore.load(contactTrustStore.getKeyStoreInputStream(), contactTrustStore.getKeyStorePassword().toCharArray());
