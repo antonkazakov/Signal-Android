@@ -3,6 +3,7 @@ package org.thoughtcrime.securesms.util;
 import android.Manifest;
 import android.accounts.Account;
 import android.accounts.AccountManager;
+import android.annotation.SuppressLint;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.OperationApplicationException;
@@ -11,6 +12,7 @@ import android.net.Uri;
 import android.os.RemoteException;
 import android.provider.ContactsContract;
 import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.text.TextUtils;
 import android.util.Log;
 
@@ -21,6 +23,7 @@ import org.thoughtcrime.securesms.ApplicationContext;
 import org.thoughtcrime.securesms.BuildConfig;
 import org.thoughtcrime.securesms.R;
 import org.thoughtcrime.securesms.contacts.ContactAccessor;
+import org.thoughtcrime.securesms.contactshare.Contact;
 import org.thoughtcrime.securesms.crypto.SessionUtil;
 import org.thoughtcrime.securesms.database.Address;
 import org.thoughtcrime.securesms.database.DatabaseFactory;
@@ -38,7 +41,6 @@ import org.whispersystems.libsignal.util.guava.Optional;
 import org.whispersystems.signalservice.api.SignalServiceAccountManager;
 import org.whispersystems.signalservice.api.push.ContactTokenDetails;
 import org.whispersystems.signalservice.api.push.TrustStore;
-import org.whispersystems.signalservice.api.push.exceptions.NonSuccessfulResponseCodeException;
 import org.whispersystems.signalservice.api.push.exceptions.PushNetworkException;
 import org.whispersystems.signalservice.internal.contacts.crypto.Quote;
 import org.whispersystems.signalservice.internal.contacts.crypto.UnauthenticatedQuoteException;
@@ -58,11 +60,16 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
 
+import io.reactivex.Observable;
+import io.reactivex.Scheduler;
+import io.reactivex.Single;
+import io.reactivex.schedulers.Schedulers;
+
 public class DirectoryHelper {
 
   private static final String TAG = DirectoryHelper.class.getSimpleName();
 
-  private static final int CONTACT_BATCH_SIZE = 2048;
+  private static final int CONTACT_DISCOVERY_BATCH_SIZE = 2048;
 
   public static void refreshDirectory(@NonNull Context context, boolean notifyOfNewUsers)
       throws IOException
@@ -70,93 +77,53 @@ public class DirectoryHelper {
     if (TextUtils.isEmpty(TextSecurePreferences.getLocalNumber(context))) return;
     if (!Permissions.hasAll(context, Manifest.permission.WRITE_CONTACTS)) return;
 
-    List<Address> newlyActiveUsers = refreshDirectory(context, AccountManagerFactory.createManager(context));
+    refreshDirectory(context, AccountManagerFactory.createManager(context), notifyOfNewUsers);
 
     if (TextSecurePreferences.isMultiDevice(context)) {
       ApplicationContext.getInstance(context)
                         .getJobManager()
                         .add(new MultiDeviceContactUpdateJob(context));
     }
-
-    if (notifyOfNewUsers) notifyNewUsers(context, newlyActiveUsers);
   }
 
-  private static @NonNull List<Address> refreshDirectory(@NonNull Context context, @NonNull SignalServiceAccountManager accountManager)
+  @SuppressLint("CheckResult")
+  private static void refreshDirectory(@NonNull Context context, @NonNull SignalServiceAccountManager accountManager, boolean notifyOfNewUsers)
       throws IOException
   {
     if (TextUtils.isEmpty(TextSecurePreferences.getLocalNumber(context))) {
-      return new LinkedList<>();
+      return;
     }
 
     if (!Permissions.hasAll(context, Manifest.permission.WRITE_CONTACTS)) {
-      return new LinkedList<>();
+      return;
     }
 
     RecipientDatabase recipientDatabase                       = DatabaseFactory.getRecipientDatabase(context);
     Stream<String>    eligibleRecipientDatabaseContactNumbers = Stream.of(recipientDatabase.getAllAddresses()).filter(Address::isPhone).map(Address::toPhoneString);
     Stream<String>    eligibleSystemDatabaseContactNumbers    = Stream.of(ContactAccessor.getInstance().getAllContactsWithNumbers(context)).map(Address::serialize);
-    Set<String>       dedupedEligibleContactNumbers           = Stream.concat(eligibleRecipientDatabaseContactNumbers, eligibleSystemDatabaseContactNumbers).collect(Collectors.toSet());
-    List<String>      eligibleContactNumbers                  = new ArrayList<>(dedupedEligibleContactNumbers);
+    Set<String>       eligibleContactNumbers                  = Stream.concat(eligibleRecipientDatabaseContactNumbers, eligibleSystemDatabaseContactNumbers).collect(Collectors.toSet());
 
-    List<Address> allActiveAddresses   = new LinkedList<>();
-    List<Address> newlyActiveAddresses = new LinkedList<>();
+    Single<DirectoryResult> legacyRetrieval         = getLegacyDirectoryResult(context, accountManager, recipientDatabase, eligibleContactNumbers, notifyOfNewUsers);
+    Single<DirectoryResult> contactServiceRetrieval = getContactServiceDirectoryResult(context, accountManager, eligibleContactNumbers);
 
-    for (int i = 0; i < eligibleContactNumbers.size(); i += CONTACT_BATCH_SIZE) {
-      List<String>  numbers      = eligibleContactNumbers.subList(i, Math.min(eligibleContactNumbers.size(), i + CONTACT_BATCH_SIZE));
-      RefreshResult result       = refreshDirectory(context, accountManager, recipientDatabase, new HashSet<>(numbers));
+    DirectoryResult legacyResult = Single.zip(legacyRetrieval, contactServiceRetrieval, (oldResult, newResult) -> {
+                                            if (oldResult.getException() == null && newResult.getException() == null) {
+                                              if (oldResult.matches(newResult)) {
+                                                Log.i(TAG, "New contact discovery service request matched existing results.");
+                                                accountManager.reportContactDiscoveryServiceMatch();
+                                              } else {
+                                                Log.w(TAG, "New contact discovery service request did NOT match existing results.");
+                                                accountManager.reportContactDiscoveryServiceMismatch();
+                                              }
+                                            }
+                                            return oldResult;
+                                          })
+                                          .subscribeOn(Schedulers.io())
+                                          .blockingGet();
 
-      allActiveAddresses.addAll(result.getAllActiveAddresses());
-      newlyActiveAddresses.addAll(result.getNewlyActiveAddresses());
-    }
-
-    updateContactsDatabase(context, allActiveAddresses, true);
-
-    if (TextSecurePreferences.hasSuccessfullyRetrievedDirectory(context)) {
-      return newlyActiveAddresses;
-    } else {
-      TextSecurePreferences.setHasSuccessfullyRetrievedDirectory(context, true);
-      return new LinkedList<>();
-    }
-  }
-
-  private static RefreshResult refreshDirectory(@NonNull Context                     context,
-                                                @NonNull SignalServiceAccountManager accountManager,
-                                                @NonNull RecipientDatabase           recipientDatabase,
-                                                @NonNull Set<String>                 numbers)
-      throws IOException
-  {
-    List<ContactTokenDetails> activeTokens = accountManager.getContacts(numbers);
-
-    if (activeTokens != null) {
-      List<Address> activeAddresses   = new LinkedList<>();
-      List<Address> inactiveAddresses = new LinkedList<>();
-
-      Set<String>  inactiveContactNumbers = new HashSet<>(numbers);
-
-      for (ContactTokenDetails activeToken : activeTokens) {
-        activeAddresses.add(Address.fromSerialized(activeToken.getNumber()));
-        inactiveContactNumbers.remove(activeToken.getNumber());
+      if (legacyResult.getException() != null) {
+        throw legacyResult.getException();
       }
-
-      for (String inactiveContactNumber : inactiveContactNumbers) {
-        inactiveAddresses.add(Address.fromSerialized(inactiveContactNumber));
-      }
-
-      Set<Address>  currentActiveAddresses = new HashSet<>(recipientDatabase.getRegistered());
-      Set<Address>  contactAddresses       = new HashSet<>(recipientDatabase.getSystemContacts());
-      List<Address> newlyActiveAddresses   = Stream.of(activeAddresses)
-                                                   .filter(address -> !currentActiveAddresses.contains(address))
-                                                   .filter(contactAddresses::contains)
-                                                   .toList();
-
-      recipientDatabase.setRegistered(activeAddresses, inactiveAddresses);
-
-      crossCheckWithNewContactDiscoveryService(context, accountManager, numbers, activeAddresses);
-
-      return new RefreshResult(activeAddresses, newlyActiveAddresses);
-    }
-
-    return new RefreshResult(Collections.emptyList(), Collections.emptyList());
   }
 
   public static RegisteredState refreshDirectoryFor(@NonNull  Context context,
@@ -185,12 +152,9 @@ public class DirectoryHelper {
         notifyNewUsers(context, Collections.singletonList(recipient.getAddress()));
       }
 
-      crossCheckWithNewContactDiscoveryService(context, accountManager, Collections.singleton(number), Collections.singletonList(recipient.getAddress()));
-
       return RegisteredState.REGISTERED;
     } else {
       recipientDatabase.setRegistered(recipient, RegisteredState.NOT_REGISTERED);
-      crossCheckWithNewContactDiscoveryService(context, accountManager, Collections.singleton(number), Collections.emptyList());
       return RegisteredState.NOT_REGISTERED;
     }
   }
@@ -283,32 +247,98 @@ public class DirectoryHelper {
     }
   }
 
-  private static void crossCheckWithNewContactDiscoveryService(@NonNull Context                     context,
-                                                               @NonNull SignalServiceAccountManager accountManager,
-                                                               @NonNull Set<String>                 requestedNumbers,
-                                                               @NonNull List<Address>               registeredAddressesLegacy)
+  private static Single<DirectoryResult> getLegacyDirectoryResult(@NonNull Context context,
+                                                                  @NonNull SignalServiceAccountManager accountManager,
+                                                                  @NonNull RecipientDatabase recipientDatabase,
+                                                                  @NonNull Set<String> eligibleContactNumbers,
+                                                                  boolean notifyOfNewUsers)
   {
-    try {
-      KeyStore     iasKeyStore      = getIasKeyStore(context);
-      List<String> registered       = accountManager.getRegisteredUsers(iasKeyStore, requestedNumbers, BuildConfig.MRENCLAVE);
-      Set<String>  registeredLegacy = Stream.of(registeredAddressesLegacy).map(Address::serialize).collect(Collectors.toSet());
+    return Single.just(eligibleContactNumbers)
+                 .subscribeOn(Schedulers.io())
+                 .map(contacts -> {
+                   try {
+                     List<ContactTokenDetails> activeTokens = accountManager.getContacts(eligibleContactNumbers);
 
-      if (registered.size() == registeredLegacy.size() && registeredLegacy.containsAll(registered)) {
-        accountManager.reportContactDiscoveryServiceMatch();
-        Log.i(TAG, "New contact discovery service request matched existing results.");
-      } else {
-        accountManager.reportContactDiscoveryServiceMismatch();
-        Log.w(TAG, "New contact discovery service request did NOT match existing results.");
-      }
-    } catch (CertificateException | SignatureException | UnauthenticatedQuoteException | UnauthenticatedResponseException | Quote.InvalidQuoteFormatException e) {
-      accountManager.reportContactDiscoveryServiceAttestationError();
-      Log.w(TAG, "Failed during attestation.", e);
-    } catch (PushNetworkException e) {
-      Log.w(TAG, "Failed due to poor network.", e);
-    } catch (IOException | NoSuchAlgorithmException | KeyStoreException e) {
-      accountManager.reportContactDiscoveryServiceUnexpectedError();
-      Log.w(TAG, "Failed for an unknown reason.", e);
+                     if (activeTokens != null) {
+                       List<Address> activeAddresses   = new LinkedList<>();
+                       List<Address> inactiveAddresses = new LinkedList<>();
+
+                       Set<String> inactiveContactNumbers = new HashSet<>(eligibleContactNumbers);
+
+                       for (ContactTokenDetails activeToken : activeTokens) {
+                         activeAddresses.add(Address.fromSerialized(activeToken.getNumber()));
+                         inactiveContactNumbers.remove(activeToken.getNumber());
+                       }
+
+                       for (String inactiveContactNumber : inactiveContactNumbers) {
+                         inactiveAddresses.add(Address.fromSerialized(inactiveContactNumber));
+                       }
+
+                       Set<Address>  currentActiveAddresses = new HashSet<>(recipientDatabase.getRegistered());
+                       Set<Address>  contactAddresses       = new HashSet<>(recipientDatabase.getSystemContacts());
+                       List<Address> newlyActiveAddresses   = Stream.of(activeAddresses)
+                           .filter(address -> !currentActiveAddresses.contains(address))
+                           .filter(contactAddresses::contains)
+                           .toList();
+
+                       recipientDatabase.setRegistered(activeAddresses, inactiveAddresses);
+                       updateContactsDatabase(context, activeAddresses, true);
+
+                       if (notifyOfNewUsers && TextSecurePreferences.hasSuccessfullyRetrievedDirectory(context)) {
+                         notifyNewUsers(context, newlyActiveAddresses);
+                       } else {
+                         TextSecurePreferences.setHasSuccessfullyRetrievedDirectory(context, true);
+                       }
+
+                       return new DirectoryResult(Stream.of(activeAddresses).map(Address::serialize).collect(Collectors.toSet()));
+                     }
+
+                     return new DirectoryResult(Collections.emptySet());
+                   } catch (IOException e) {
+                     return new DirectoryResult(Collections.emptySet(), e);
+                   }
+                 });
+  }
+
+  private static Single<DirectoryResult> getContactServiceDirectoryResult(@NonNull Context context,
+                                                                          @NonNull SignalServiceAccountManager accountManager,
+                                                                          @NonNull Set<String> eligibleContactNumbers)
+  {
+    return Observable.just(eligibleContactNumbers)
+                     .subscribeOn(Schedulers.io())
+                     .flatMap(numbers -> Observable.fromIterable(splitIntoBatches(numbers, CONTACT_DISCOVERY_BATCH_SIZE)))
+                     .flatMap(batch -> {
+                       return Observable.defer(() -> {
+                         try {
+                           List<String> numbers = accountManager.getRegisteredUsers(getIasKeyStore(context), batch, BuildConfig.MRENCLAVE);
+                           return Observable.just(new DirectoryResult(new HashSet<>(numbers)));
+                         } catch (CertificateException | SignatureException | UnauthenticatedQuoteException | UnauthenticatedResponseException | Quote.InvalidQuoteFormatException e) {
+                           Log.w(TAG, "Failed during attestation.", e);
+                           accountManager.reportContactDiscoveryServiceAttestationError();
+                           return Observable.just(new DirectoryResult(Collections.emptySet(), new IOException(e)));
+                         } catch (PushNetworkException e) {
+                           Log.w(TAG, "Failed due to poor network.", e);
+                           return Observable.just(new DirectoryResult(Collections.emptySet(), e));
+                         } catch (IOException | NoSuchAlgorithmException | KeyStoreException e) {
+                           Log.w(TAG, "Failed for an unknown reason.", e);
+                           accountManager.reportContactDiscoveryServiceUnexpectedError();
+                           return Observable.just(new DirectoryResult(Collections.emptySet(), new IOException(e)));
+                         }
+                       }).subscribeOn(Schedulers.io());
+                     })
+                     .collectInto(new DirectoryResult(new HashSet<>()), DirectoryResult::combine);
+  }
+
+  private static List<Set<String>> splitIntoBatches(@NonNull Set<String> numbers, int batchSize) {
+    List<String>      numberList = new ArrayList<>(numbers);
+    List<Set<String>> batches    = new LinkedList<>();
+
+    for (int i = 0; i < numberList.size(); i += batchSize) {
+      List<String> batch = numberList.subList(i, Math.min(numberList.size(), i + batchSize));
+      batches.add(new HashSet<>(batch));
     }
+
+    return batches;
   }
 
   private static KeyStore getIasKeyStore(@NonNull Context context)
@@ -322,6 +352,34 @@ public class DirectoryHelper {
     return keyStore;
   }
 
+  private static class DirectoryResult {
+
+    private final Set<String> numbers;
+
+    private IOException exception;
+
+    DirectoryResult(@NonNull Set<String> numbers) {
+      this(numbers, null);
+    }
+
+    DirectoryResult(@NonNull Set<String> numbers, @Nullable IOException exception) {
+      this.numbers   = numbers;
+      this.exception = exception;
+    }
+
+    void combine(@NonNull DirectoryResult other) {
+      this.numbers.addAll(other.numbers);
+      this.exception = (this.exception != null) ? this.exception : other.exception;
+    }
+
+    boolean matches(@NonNull DirectoryResult other) {
+      return this.numbers.size() == other.numbers.size() && this.numbers.containsAll(other.numbers);
+    }
+
+    IOException getException() {
+      return exception;
+    }
+  }
 
   private static class AccountHolder {
 
@@ -344,22 +402,4 @@ public class DirectoryHelper {
 
   }
 
-  private static class RefreshResult {
-
-    private final List<Address> allActiveAddresses;
-    private final List<Address> newlyActiveAddresses;
-
-    private RefreshResult(List<Address> allActiveAddresses, List<Address> newlyActiveAddresses) {
-      this.allActiveAddresses = allActiveAddresses;
-      this.newlyActiveAddresses = newlyActiveAddresses;
-    }
-
-    public List<Address> getAllActiveAddresses() {
-      return allActiveAddresses;
-    }
-
-    public List<Address> getNewlyActiveAddresses() {
-      return newlyActiveAddresses;
-    }
-  }
 }
