@@ -54,6 +54,7 @@ import org.thoughtcrime.securesms.mms.OutgoingLegacyMmsConnection;
 import org.whispersystems.libsignal.util.guava.Optional;
 
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -171,17 +172,9 @@ public class Util {
     }
   }
 
-  public static void close(InputStream in) {
+  public static void close(Closeable closeable) {
     try {
-      in.close();
-    } catch (IOException e) {
-      Log.w(TAG, e);
-    }
-  }
-
-  public static void close(OutputStream out) {
-    try {
-      out.close();
+      closeable.close();
     } catch (IOException e) {
       Log.w(TAG, e);
     }

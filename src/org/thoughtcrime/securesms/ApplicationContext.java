@@ -25,7 +25,8 @@ import android.os.AsyncTask;
 import android.os.Build;
 import android.support.annotation.NonNull;
 import android.support.multidex.MultiDexApplication;
-import android.util.Log;
+
+import org.thoughtcrime.securesms.logging.Log;
 
 import com.google.android.gms.security.ProviderInstaller;
 
@@ -43,6 +44,9 @@ import org.thoughtcrime.securesms.jobs.MultiDeviceContactUpdateJob;
 import org.thoughtcrime.securesms.jobs.requirements.MasterSecretRequirementProvider;
 import org.thoughtcrime.securesms.jobs.requirements.ServiceRequirementProvider;
 import org.thoughtcrime.securesms.jobs.requirements.SqlCipherMigrationRequirementProvider;
+import org.thoughtcrime.securesms.logging.AndroidLogger;
+import org.thoughtcrime.securesms.logging.PersistentLogger;
+import org.thoughtcrime.securesms.logging.UncaughtExceptionLogger;
 import org.thoughtcrime.securesms.push.SignalServiceNetworkAccess;
 import org.thoughtcrime.securesms.service.DirectoryRefreshListener;
 import org.thoughtcrime.securesms.service.ExpiringMessageManager;
@@ -78,6 +82,7 @@ public class ApplicationContext extends MultiDexApplication implements Dependenc
   private ExpiringMessageManager expiringMessageManager;
   private JobManager             jobManager;
   private ObjectGraph            objectGraph;
+  private PersistentLogger       persistentLogger;
 
   private volatile boolean isAppVisible;
 
@@ -90,6 +95,7 @@ public class ApplicationContext extends MultiDexApplication implements Dependenc
     super.onCreate();
     initializeRandomNumberFix();
     initializeLogging();
+    initializeCrashHandling();
     initializeDependencyInjection();
     initializeJobManager();
     initializeExpiringMessageManager();
@@ -104,7 +110,7 @@ public class ApplicationContext extends MultiDexApplication implements Dependenc
   @Override
   public void onStart(@NonNull LifecycleOwner owner) {
     isAppVisible = true;
-    Log.i(TAG, "App is now visible.");
+    android.util.Log.i(TAG, "App is now visible.");
 
     executePendingContactSync();
   }
@@ -112,7 +118,7 @@ public class ApplicationContext extends MultiDexApplication implements Dependenc
   @Override
   public void onStop(@NonNull LifecycleOwner owner) {
     isAppVisible = false;
-    Log.i(TAG, "App is no longer visible.");
+    android.util.Log.i(TAG, "App is no longer visible.");
   }
 
   @Override
@@ -134,12 +140,25 @@ public class ApplicationContext extends MultiDexApplication implements Dependenc
     return isAppVisible;
   }
 
+  public PersistentLogger getPersistentLogger() {
+    return persistentLogger;
+  }
+
   private void initializeRandomNumberFix() {
     PRNGFixes.apply();
   }
 
   private void initializeLogging() {
+    // TODO(greyson): Remember to update this to use the new logger
     SignalProtocolLoggerProvider.setProvider(new AndroidSignalProtocolLogger());
+
+    persistentLogger = new PersistentLogger(this);
+    Log.initialize(new AndroidLogger(), persistentLogger);
+  }
+
+  private void initializeCrashHandling() {
+    final Thread.UncaughtExceptionHandler originalHandler = Thread.getDefaultUncaughtExceptionHandler();
+    Thread.setDefaultUncaughtExceptionHandler(new UncaughtExceptionLogger(originalHandler, persistentLogger));
   }
 
   private void initializeJobManager() {
@@ -220,7 +239,7 @@ public class ApplicationContext extends MultiDexApplication implements Dependenc
                                                             .setEnableVideoHwAcceleration(true)
                                                             .createInitializationOptions());
     } catch (UnsatisfiedLinkError e) {
-      Log.w(TAG, e);
+      android.util.Log.w(TAG, e);
     }
   }
 
@@ -233,7 +252,7 @@ public class ApplicationContext extends MultiDexApplication implements Dependenc
           try {
             ProviderInstaller.installIfNeeded(ApplicationContext.this);
           } catch (Throwable t) {
-            Log.w(TAG, t);
+            android.util.Log.w(TAG, t);
           }
         }
         return null;
